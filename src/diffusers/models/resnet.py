@@ -3,6 +3,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 
 
 class Upsample1D(nn.Module):
@@ -373,6 +374,7 @@ class ResnetBlock2D(nn.Module):
         conv_shortcut=False,
         dropout=0.0,
         temb_channels=512,
+        extra_channels=None,
         groups=32,
         groups_out=None,
         pre_norm=True,
@@ -404,17 +406,35 @@ class ResnetBlock2D(nn.Module):
 
         self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
-        if temb_channels is not None:
-            if self.time_embedding_norm == "default":
-                time_emb_proj_out_channels = out_channels
-            elif self.time_embedding_norm == "scale_shift":
-                time_emb_proj_out_channels = out_channels * 2
-            else:
-                raise ValueError(f"unknown time_embedding_norm : {self.time_embedding_norm} ")
-
-            self.time_emb_proj = torch.nn.Linear(temb_channels, time_emb_proj_out_channels)
+        if self.time_embedding_norm == "default":
+            cond_proj_out_channels = out_channels
+        elif self.time_embedding_norm == "scale_shift":
+            cond_proj_out_channels = out_channels * 2
         else:
-            self.time_emb_proj = None
+            raise ValueError(f"unknown time_embedding_norm : {self.time_embedding_norm} ")
+
+        if temb_channels is None:
+            if extra_channels is None:
+                self.cond_proj = None
+            else:
+                self.cond_proj = torch.nn.Conv2d(
+                    extra_channels,
+                    cond_proj_out_channels,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                )
+        else:
+            if extra_channels is None:
+                self.cond_proj = torch.nn.Linear(temb_channels, cond_proj_out_channels)
+            else:
+                self.cond_proj = torch.nn.Conv2d(
+                    extra_channels + temb_channels,
+                    cond_proj_out_channels,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                )
 
         self.norm2 = torch.nn.GroupNorm(num_groups=groups_out, num_channels=out_channels, eps=eps, affine=True)
         self.dropout = torch.nn.Dropout(dropout)
@@ -451,7 +471,7 @@ class ResnetBlock2D(nn.Module):
         if self.use_in_shortcut:
             self.conv_shortcut = torch.nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, input_tensor, temb):
+    def forward(self, input_tensor, temb, extra=None):
         hidden_states = input_tensor
 
         hidden_states = self.norm1(hidden_states)
@@ -470,16 +490,26 @@ class ResnetBlock2D(nn.Module):
 
         hidden_states = self.conv1(hidden_states)
 
-        if temb is not None:
-            temb = self.time_emb_proj(self.nonlinearity(temb))[:, :, None, None]
+        cond = None
+        if extra is not None:
+            extra = torchvision.transforms.Resize(hidden_states.size[-2:])(extra)
+            if temb is not None:
+                cond = self.cond_proj(torch.concat((
+                    self.nonlinearity(extra),
+                    self.nonlinearity(temb)[:, :, None, None],
+                ), dim=1))
+            else:
+                cond = self.cond_proj(self.nonlinearity(extra))
+        elif temb is not None:
+            cond = self.cond_proj(self.nonlinearity(temb))[:, :, None, None]
 
-        if temb is not None and self.time_embedding_norm == "default":
-            hidden_states = hidden_states + temb
+        if cond is not None and self.time_embedding_norm == "default":
+            hidden_states = hidden_states + cond
 
         hidden_states = self.norm2(hidden_states)
 
-        if temb is not None and self.time_embedding_norm == "scale_shift":
-            scale, shift = torch.chunk(temb, 2, dim=1)
+        if cond is not None and self.time_embedding_norm == "scale_shift":
+            scale, shift = torch.chunk(cond, 2, dim=1)
             hidden_states = hidden_states * (1 + scale) + shift
 
         hidden_states = self.nonlinearity(hidden_states)
